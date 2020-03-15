@@ -4,9 +4,10 @@ import Html exposing (Html, div, h1, h2, text, img, i, li, ul, strong, input, bu
 import Html.Attributes exposing (class, src, placeholder, type_, disabled, value)
 import Html.Events exposing (onClick, onInput, onSubmit)
 import Browser
-import Json.Decode exposing (Decoder, bool, int, list, string, succeed)
+import Json.Decode exposing (Decoder, bool, int, list, string, succeed, decodeString)
 import Json.Decode.Pipeline exposing (hardcoded, required)
 import Http
+import WebSocket
 
 main : Program () Model Msg
 main =
@@ -29,6 +30,22 @@ type alias Photo =
     , newComment : String
     }
 
+type alias Feed =
+    List Photo
+
+type alias Model =
+    { feed : Maybe Feed
+    , error : Maybe Http.Error
+    , streamQueue : Feed
+    }
+
+initialModel : Model
+initialModel =
+    { feed = Nothing
+    , error = Nothing
+    , streamQueue = []
+    }
+
 photoDecoder : Decoder Photo
 photoDecoder =
     succeed Photo
@@ -39,14 +56,6 @@ photoDecoder =
         |> required "comments" (list string)
         |> hardcoded ""
 
-
-type alias Model =
-    { photo : Maybe Photo }
-
-initialModel : Model
-initialModel =
-    { photo = Nothing }
-
 init : () -> ( Model, Cmd Msg )
 init () =
     ( initialModel, fetchFeed )
@@ -54,8 +63,8 @@ init () =
 fetchFeed : Cmd Msg
 fetchFeed =
     Http.get
-        { url = baseUrl ++ "feed/1"
-        , expect = Http.expectJson LoadFeed photoDecoder
+        { url = baseUrl ++ "feed"
+        , expect = Http.expectJson LoadFeed (list photoDecoder)
         }
 
 view : Model -> Html Msg
@@ -64,12 +73,13 @@ view model =
         [ div [ class "header" ]
             [ h1 [] [ text "Picshare" ] ]
         , div [ class "content-flow" ]
-            [ viewFeed model.photo ]
+            [ viewContent model ]
         ]
 
 subscriptions : Model -> Sub Msg
 subscriptions model =
-    Sub.none
+    WebSocket.receive
+        (LoadStreamPhoto << decodeString photoDecoder)
 
 toggleLike : Photo -> Photo
 toggleLike photo =
@@ -79,43 +89,56 @@ updateComment : String -> Photo -> Photo
 updateComment comment photo =
     { photo | newComment = comment }
 
-updateFeed : (Photo -> Photo) -> Maybe Photo -> Maybe Photo
-updateFeed updatePhoto maybePhoto =
-    Maybe.map updatePhoto maybePhoto
+updateFeed : (Photo -> Photo) -> Id-> Maybe Feed -> Maybe Feed
+updateFeed updatePhoto id maybeFeed =
+    Maybe.map (updatePhotoById updatePhoto id) maybeFeed
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
     case msg of
-        ToggleLike ->
+        ToggleLike id ->
             ( { model
-                | photo = updateFeed toggleLike model.photo
+                | feed = updateFeed toggleLike id model.feed
               }
             , Cmd.none
             )
-        UpdateComment comment ->
+        UpdateComment id comment ->
             ( { model
-                | photo = updateFeed (updateComment comment) model.photo
+                | feed = updateFeed (updateComment comment) id model.feed
               }
             , Cmd.none
             )
-        SaveComment ->
+        SaveComment id ->
             ( { model
-                | photo = updateFeed saveNewComment model.photo
+                | feed = updateFeed saveNewComment id model.feed
               }
             , Cmd.none
             )
-        LoadFeed (Ok photo) ->
-            ( { model | photo = Just photo }
+        LoadFeed (Ok feed) ->
+            ( { model | feed = Just feed }
+            , WebSocket.listen wsUrl
+            )
+        LoadFeed (Err error) ->
+            ( { model | error = Just error }, Cmd.none )
+        LoadStreamPhoto (Ok photo) ->
+            ( { model | streamQueue = photo :: model.streamQueue }
             , Cmd.none
             )
-        LoadFeed (Err _) ->
+        LoadStreamPhoto (Err _) ->
             ( model, Cmd.none )
+        FlushStreamQueue ->
+            ( { model
+                | feed = Maybe.map ((++) model.streamQueue) model.feed
+                , streamQueue = []
+              }
+            , Cmd.none
+            )
 
-viewFeed : Maybe Photo -> Html Msg
-viewFeed maybePhoto =
-    case maybePhoto of
-        Just photo ->
-            viewDetailedPhoto photo
+viewFeed : Maybe Feed -> Html Msg
+viewFeed maybeFeed =
+    case maybeFeed of
+        Just feed ->
+            div [] (List.map viewDetailedPhoto feed)
         Nothing ->
             div [ class "loading-feed" ]
                 [ text "Loading feed..." ]
@@ -139,11 +162,36 @@ saveNewComment photo =
 baseUrl : String
 baseUrl = "https:/programming-elm.com/"
 
+wsUrl : String
+wsUrl = "wss://programming-elm.com"
+
 type Msg
-    = ToggleLike
-    | UpdateComment String
-    | SaveComment
-    | LoadFeed (Result Http.Error Photo)
+    = ToggleLike Id
+    | UpdateComment Id String
+    | SaveComment Id
+    | LoadFeed (Result Http.Error Feed)
+    | LoadStreamPhoto (Result Json.Decode.Error Photo)
+    | FlushStreamQueue
+
+viewStreamNotification : Feed -> Html Msg
+viewStreamNotification queue =
+    case queue of
+        [] ->
+            text ""
+
+        _ ->
+            let
+                content =
+                    "View new photos: "
+                        ++ String.fromInt (List.length queue)
+            in
+            div
+                [ class "stream-notification"
+                , onClick FlushStreamQueue
+                ]
+                [ text content]
+
+
 
 viewLoveButton : Photo -> Html Msg
 viewLoveButton photo =
@@ -158,7 +206,7 @@ viewLoveButton photo =
         [ i
             [ class "fa fa-2x"
             , class buttonClass
-            , onClick ToggleLike
+            , onClick (ToggleLike photo.id)
             ]
             []
         ]
@@ -169,6 +217,26 @@ viewComment comment =
         [ strong [] [ text "Comment:" ]
         , text ( " " ++ comment )
         ]
+
+viewContent : Model -> Html Msg
+viewContent model =
+    case model.error of
+        Just error ->
+            div [ class "feed-error" ]
+                [ text (errorMessage error) ]
+        Nothing ->
+            div []
+                [ viewStreamNotification model.streamQueue
+                , viewFeed model.feed
+                ]
+
+errorMessage : Http.Error -> String
+errorMessage error =
+    case error of
+        Http.BadBody _ ->
+            "Sorry, we couldn't process the feed, we're working on it"
+        _ ->
+            "Sorry, we couldn't process the feed, try again."
 
 viewCommentList : List String -> Html Msg
 viewCommentList comments =
@@ -185,12 +253,12 @@ viewComments : Photo -> Html Msg
 viewComments photo =
     div []
         [ viewCommentList photo.comments
-        , form [ class "new-comment", onSubmit SaveComment ]
+        , form [ class "new-comment", onSubmit (SaveComment photo.id) ]
             [ input
                 [ type_ "text"
                 , placeholder "Add a comment..."
                 , value photo.newComment
-                , onInput UpdateComment
+                , onInput (UpdateComment photo.id)
                 ]
                 []
             , button
@@ -199,6 +267,16 @@ viewComments photo =
             ]
         ]
 
+updatePhotoById : (Photo -> Photo) -> Id -> Feed -> Feed
+updatePhotoById updatePhoto id feed =
+    List.map
+        (\photo ->
+            if photo.id == id then
+                updatePhoto photo
+            else
+                photo
+        )
+        feed
 
 viewDetailedPhoto : Photo -> Html Msg
 viewDetailedPhoto photo =
